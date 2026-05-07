@@ -38,6 +38,7 @@ COMPANIES=12 PRODUCTS_PER_COMPANY=10 node server.js
 ```sh
 cd app
 npm install
+rm -rf .next out
 COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
 SEMAPHORE_LIMIT=0 \
 API_URL=http://localhost:3001 \
@@ -46,8 +47,11 @@ npm run build
 
 ターミナル2 — App ビルド（セマフォ ON、上限20）:
 ```sh
+rm -rf .next out
 SEMAPHORE_LIMIT=20 npm run build
 ```
+
+> **重要**: 各ビルドの前に `rm -rf .next out` を必ず実行する。Next.js の `fetch()` は標準で `.next/cache/fetch-cache/` にディスクキャッシュするため、2回目以降は同じ URL の fetch がキャッシュヒットして API サーバーに届かなくなり、`[FINAL] peak` が Phase 1 ぶん（12社+1=13）程度しか出なくなる。
 
 ## 検証結果の見方
 
