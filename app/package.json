@@ -1,0 +1,21 @@
+{
+  "name": "build-api-throttle-app",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev"
+  },
+  "dependencies": {
+    "next": "^16.2.5",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "undici": "^8.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.6.0"
+  }
+}
