@@ -49,14 +49,56 @@ npm run build
 SEMAPHORE_LIMIT=20 npm run build
 ```
 
-API 側ターミナルの `[FINAL] peak=...` がそのビルドにおける同時接続ピーク（API サーバーから見た値）。
-App 側 stdout の `[CLIENT pid=... demand peak=...]` がワーカー単位のクライアント側 demand（fetch 呼び出し中の数）。
+## 検証結果の見方
 
-## 計測項目
+ビルド中・ビルド後に2種類のログが出る。両者は別の場所で別のものを数えている点に注意。
 
-1. セマフォ OFF: API 側 peak が大きく（demand と近い値）出る
-2. セマフォ ON (limit=20): API 側 peak がワーカー数 × 20 程度に張り付く
-3. ワーカー単位の demand peak がセマフォ active を上回る現象（記事の主張）
+### ログ1: API 側ターミナル
+
+ビルド完了後に API サーバーを `Ctrl+C` で止めると、最後にこの行が出る:
+
+```
+[FINAL] {
+  "peak": 87,
+  "totalRequests": 732
+}
+```
+
+- `peak` … API サーバーが受けた同時接続数の最大値。リクエスト受信で `+1`、レスポンス送信で `-1` する素朴なカウンタ（[api/server.js:8-9](api/server.js#L8-L9), [api/server.js:24-26](api/server.js#L24-L26)）
+- `totalRequests` … ビルド全体で受けた総リクエスト数
+
+ここで見る数字は「全ワーカー合計」のサーバー視点。複数のワーカーが同時に叩いていれば、その総和としてピークが立つ。
+
+### ログ2: App 側 stdout（ビルドログ）
+
+`npm run build` の出力中に、ワーカーごとに demand peak が更新されたタイミングで出る:
+
+```
+[CLIENT pid=12345] demand peak=42 sem=OFF path=/api/products/company-3-product-7
+[CLIENT pid=12345] demand peak=43 sem=OFF path=/api/products/company-3-product-8
+[CLIENT pid=12678] demand peak=39 sem=OFF path=/api/products/company-5-product-2
+```
+
+セマフォ ON のときは `sem` の中身が `{"active":N,"peak":M,"waiting":W}` になる:
+
+```
+[CLIENT pid=12345] demand peak=42 sem={"active":20,"peak":20,"waiting":22} path=...
+```
+
+各フィールドの意味（[app/lib/api-client.ts:11-19](app/lib/api-client.ts#L11-L19), [app/lib/semaphore.ts:29-31](app/lib/semaphore.ts#L29-L31)）:
+
+- `pid` … ビルドワーカーのプロセス ID。ワーカーごとに別行が出るので、`pid` が複数見えれば複数ワーカーが走っている
+- `demand` … その瞬間に「fetch を呼び出している最中」の数。セマフォ ON でも、acquire 待ちの fetch まで含めて demand に乗る点が肝。`rawFetch` 入口で `+1`、`finally` で `-1`
+- `demand peak` … そのワーカーで観測した demand の最大値。更新時のみ出力されるので、各 `pid` の最後の行がそのワーカーの最終ピーク
+- `sem.active` … セマフォを取得して実際に fetch を流している数。`limit` を超えない
+- `sem.peak` … `active` の最大値（≤ `limit`）
+- `sem.waiting` … acquire を待っている数。これが大きいほど、fetch を呼んだ後に待たされた呼び出しが多い
+
+### 解釈の指針
+
+1. セマフォ OFF（`SEMAPHORE_LIMIT=0`）: API 側 `peak` が大きい値で出る。商品が多いほど、Promise.all などで一気にぶら下がった fetch がそのまま接続として開く。ワーカーごとの `demand peak` も大きく、両者は近い値になる
+2. セマフォ ON（`SEMAPHORE_LIMIT=20`）: API 側 `peak` は概ね「ワーカー数 × 20」あたりに頭打ちになる。各ワーカーの `sem.peak` は20で張り付き、超過分は `sem.waiting` に積まれる
+3. ワーカー単位の `demand peak` が `sem.peak`（=`limit`）を超える現象: セマフォ ON でも `demand peak` は `limit` より大きい値が出る。これは「fetch を呼んだが acquire 待ちで止まっている」呼び出しが demand に乗っているため。**接続数（API 側 peak）と関数呼び出しの concurrency（demand）は別物**で、セマフォは前者だけを抑える、というのが記事の主張に対応する観察
 
 ## 既知の前提・限界
 
