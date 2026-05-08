@@ -18,20 +18,26 @@ function logDemand(path: string) {
   }
 }
 
+async function doFetch<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_URL}${path}`);
+  if (!res.ok) {
+    throw new Error(`fetch ${path} failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as T;
+}
+
 async function rawFetch<T>(path: string): Promise<T> {
   logDemand(path);
   try {
     if (semaphore) {
       await semaphore.acquire();
       try {
-        const res = await fetch(`${API_URL}${path}`);
-        return (await res.json()) as T;
+        return await doFetch<T>(path);
       } finally {
         semaphore.release();
       }
     }
-    const res = await fetch(`${API_URL}${path}`);
-    return (await res.json()) as T;
+    return await doFetch<T>(path);
   } finally {
     demand--;
   }

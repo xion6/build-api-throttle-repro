@@ -19,6 +19,7 @@ Next.js のビルド時に API 同時接続数が爆発する現象を再現し�
 | `RESPONSE_DELAY_MS` | 100 | 応答遅延（ms） |
 | `COMPANIES` | 5 | `/api/companies` が返す件数 |
 | `PRODUCTS_PER_COMPANY` | 5 | 1社あたりの商品件数 |
+| `MAX_INFLIGHT` | `0` | 同時処理中リクエストの上限。`0` で無制限。`>0` で超過分は `503` を即返す（パンク模擬） |
 
 ### App 側（ビルド時に参照）
 | 変数 | 既定値 | 意味 |
@@ -28,13 +29,13 @@ Next.js のビルド時に API 同時接続数が爆発する現象を再現し�
 
 ## 実行手順
 
-ターミナル1 — API サーバー起動:
+ターミナル1 — API サーバー起動（`MAX_INFLIGHT=30` で同時30件超過は503を返す）:
 ```sh
 cd api
-COMPANIES=12 PRODUCTS_PER_COMPANY=10 node server.js
+COMPANIES=12 PRODUCTS_PER_COMPANY=10 MAX_INFLIGHT=30 node server.js
 ```
 
-ターミナル2 — App ビルド（セマフォ OFF）:
+ターミナル2 — App ビルド（セマフォ OFF → 503 でビルド失敗が再現）:
 ```sh
 cd app
 npm install
@@ -45,13 +46,15 @@ API_URL=http://localhost:3001 \
 npm run build
 ```
 
-ターミナル2 — App ビルド（セマフォ ON、上限20）:
+ターミナル2 — App ビルド（セマフォ ON、上限5 → 503 が出ずビルド成功）:
 ```sh
 rm -rf .next out
-SEMAPHORE_LIMIT=20 npm run build
+SEMAPHORE_LIMIT=5 npm run build
 ```
 
-> **重要**: 各ビルドの前に `rm -rf .next out` を必ず実行する。Next.js の `fetch()` は標準で `.next/cache/fetch-cache/` にディスクキャッシュするため、2回目以降は同じ URL の fetch がキャッシュヒットして API サーバーに届かなくなり、`[FINAL] peak` が Phase 1 ぶん（12社+1=13）程度しか出なくなる。
+> 同時接続だけ観察したい（パンクさせない）ときは API 側で `MAX_INFLIGHT` を外す（既定の `0`）。
+
+> **重要**: 各ビルド前に rm -rf .next out を実行する。Next.js 16のfetch既定はauto no cacheだが、静的プリレンダー時はビルドキャッシュ（.next/cache/fetch-cache）が再利用され、同一URLの再取得がAPIに届かない場合がある。
 
 ## 検証結果の見方
 
@@ -63,13 +66,15 @@ SEMAPHORE_LIMIT=20 npm run build
 
 ```
 [FINAL] {
-  "peak": 87,
-  "totalRequests": 732
+  "peak": 30,
+  "totalRequests": 45,
+  "rejected503": 2
 }
 ```
 
-- `peak` … API サーバーが受けた同時接続数の最大値。リクエスト受信で `+1`、レスポンス送信で `-1` する素朴なカウンタ（[api/server.js:8-9](api/server.js#L8-L9), [api/server.js:24-26](api/server.js#L24-L26)）
-- `totalRequests` … ビルド全体で受けた総リクエスト数
+- `peak` … API サーバーが受けた同時処理中リクエストの最大値。受け付けて処理開始で `+1`、応答送信で `-1` する素朴なカウンタ
+- `totalRequests` … ビルド全体で受けた総リクエスト数（503 で即返したぶんも含む）
+- `rejected503` … `MAX_INFLIGHT` 超過で 503 を返した件数。`>0` ならパンクが起きた証拠
 
 ここで見る数字は「全ワーカー合計」のサーバー視点。複数のワーカーが同時に叩いていれば、その総和としてピークが立つ。
 
@@ -100,8 +105,8 @@ SEMAPHORE_LIMIT=20 npm run build
 
 ### 解釈の指針
 
-1. セマフォ OFF（`SEMAPHORE_LIMIT=0`）: API 側 `peak` が大きい値で出る。商品が多いほど、Promise.all などで一気にぶら下がった fetch がそのまま接続として開く。ワーカーごとの `demand peak` も大きく、両者は近い値になる
-2. セマフォ ON（`SEMAPHORE_LIMIT=20`）: API 側 `peak` は概ね「ワーカー数 × 20」あたりに頭打ちになる。各ワーカーの `sem.peak` は20で張り付き、超過分は `sem.waiting` に積まれる
+1. セマフォ OFF + `MAX_INFLIGHT=30`: 同時接続が 30 で頭打ちになり、超えたぶんは 503。`api-client.ts` が非 2xx で `throw` するためビルドが `Error: fetch ... failed: 503` で落ちる。`rejected503 > 0` で観測できる
+2. セマフォ ON（`SEMAPHORE_LIMIT=5`）+ `MAX_INFLIGHT=30`: API 側 `peak` が `ワーカー数 × 5 = 25` 前後で頭打ち、`MAX_INFLIGHT` を踏まないので 503 が出ずビルド成功
 3. ワーカー単位の `demand peak` が `sem.peak`（=`limit`）を超える現象: セマフォ ON でも `demand peak` は `limit` より大きい値が出る。これは「fetch を呼んだが acquire 待ちで止まっている」呼び出しが demand に乗っているため。**接続数（API 側 peak）と関数呼び出しの concurrency（demand）は別物**で、セマフォは前者だけを抑える、というのが記事の主張に対応する観察
 
 ## 既知の前提・限界

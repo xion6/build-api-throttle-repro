@@ -4,10 +4,12 @@ const PORT = parseInt(process.env.PORT || '3001', 10);
 const DELAY_MS = parseInt(process.env.RESPONSE_DELAY_MS || '100', 10);
 const COMPANIES = parseInt(process.env.COMPANIES || '5', 10);
 const PRODUCTS_PER_COMPANY = parseInt(process.env.PRODUCTS_PER_COMPANY || '5', 10);
+const MAX_INFLIGHT = parseInt(process.env.MAX_INFLIGHT || '0', 10);
 
 let active = 0;
 let peak = 0;
 let totalRequests = 0;
+let rejected503 = 0;
 let lastSampledPeak = 0;
 
 const samples = [];
@@ -21,8 +23,17 @@ const sampler = setInterval(() => {
 }, 10);
 
 const server = http.createServer((req, res) => {
-  active++;
   totalRequests++;
+
+  if (MAX_INFLIGHT > 0 && active >= MAX_INFLIGHT) {
+    rejected503++;
+    res.statusCode = 503;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'overloaded', inflight: active, limit: MAX_INFLIGHT }));
+    return;
+  }
+
+  active++;
   if (active > peak) peak = active;
 
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -67,13 +78,13 @@ server.keepAliveTimeout = 30_000;
 
 server.listen(PORT, () => {
   console.log(
-    `[API] http://localhost:${PORT} delay=${DELAY_MS}ms companies=${COMPANIES} products/company=${PRODUCTS_PER_COMPANY}`,
+    `[API] http://localhost:${PORT} delay=${DELAY_MS}ms companies=${COMPANIES} products/company=${PRODUCTS_PER_COMPANY} maxInflight=${MAX_INFLIGHT || 'unlimited'}`,
   );
 });
 
 function shutdown() {
   clearInterval(sampler);
-  console.log('\n[FINAL]', JSON.stringify({ peak, totalRequests }, null, 2));
+  console.log('\n[FINAL]', JSON.stringify({ peak, totalRequests, rejected503 }, null, 2));
   console.log('[SAMPLES_LEN]', samples.length);
   if (process.env.DUMP_SAMPLES === '1') {
     console.log('[SAMPLES]', JSON.stringify(samples));
