@@ -1,4 +1,5 @@
 const http = require('node:http');
+const fs = require('node:fs');
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const DELAY_MS = parseInt(process.env.RESPONSE_DELAY_MS || '100', 10);
@@ -8,6 +9,10 @@ const MAX_INFLIGHT = parseInt(process.env.MAX_INFLIGHT || '0', 10);
 
 let active = 0;
 let peak = 0;
+let activeList = 0;
+let peakList = 0;
+let activeDetail = 0;
+let peakDetail = 0;
 let totalRequests = 0;
 let rejected503 = 0;
 let lastSampledPeak = 0;
@@ -39,6 +44,17 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
 
+  const isList = /^\/api\/companies\/[^/]+\/products$/.test(path);
+  const isDetail = /^\/api\/products\/[^/]+$/.test(path);
+  if (isList) {
+    activeList++;
+    if (activeList > peakList) peakList = activeList;
+  }
+  if (isDetail) {
+    activeDetail++;
+    if (activeDetail > peakDetail) peakDetail = activeDetail;
+  }
+
   setTimeout(() => {
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Connection', 'keep-alive');
@@ -49,14 +65,14 @@ const server = http.createServer((req, res) => {
         name: `Company ${i + 1}`,
       }));
       res.end(JSON.stringify(companies));
-    } else if (path.match(/^\/api\/companies\/[^/]+\/products$/)) {
+    } else if (isList) {
       const companyId = path.split('/')[3];
       const products = Array.from({ length: PRODUCTS_PER_COMPANY }, (_, i) => ({
         id: `${companyId}-product-${i + 1}`,
         companyId,
       }));
       res.end(JSON.stringify(products));
-    } else if (path.match(/^\/api\/products\/[^/]+$/)) {
+    } else if (isDetail) {
       const productId = path.split('/')[3];
       res.end(
         JSON.stringify({
@@ -71,6 +87,8 @@ const server = http.createServer((req, res) => {
     }
 
     active--;
+    if (isList) activeList--;
+    if (isDetail) activeDetail--;
   }, DELAY_MS);
 });
 
@@ -84,10 +102,14 @@ server.listen(PORT, () => {
 
 function shutdown() {
   clearInterval(sampler);
-  console.log('\n[FINAL]', JSON.stringify({ peak, totalRequests, rejected503 }, null, 2));
-  console.log('[SAMPLES_LEN]', samples.length);
+  const result = { peak, peakList, peakDetail, totalRequests, rejected503 };
+  if (process.env.RESULT_FILE) {
+    fs.writeFileSync(process.env.RESULT_FILE, JSON.stringify(result));
+  }
+  fs.writeSync(1, '\n[FINAL] ' + JSON.stringify(result, null, 2) + '\n');
+  fs.writeSync(1, '[SAMPLES_LEN] ' + samples.length + '\n');
   if (process.env.DUMP_SAMPLES === '1') {
-    console.log('[SAMPLES]', JSON.stringify(samples));
+    fs.writeSync(1, '[SAMPLES] ' + JSON.stringify(samples) + '\n');
   }
   process.exit(0);
 }

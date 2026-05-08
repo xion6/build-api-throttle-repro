@@ -28,6 +28,7 @@ Next.js のビルド時に API 同時接続数が爆発する現象を再現し�
 | `SEMAPHORE_LIMIT` | `0` | `0` でセマフォ OFF。`>0` で同時実行を制限 |
 | `UNDICI_LIMIT_PER_WORKER` | `0` | `>0` で `api-client.ts` 初期化時に `setGlobalDispatcher(new Agent({ connections: N }))` を呼ぶ（ワーカー側設定の検証用） |
 | `UNDICI_LIMIT` | `1` | `--require ./preload-dispatcher.js` で起動したときに使う `connections` 値（親→ワーカーへの伝搬検証用） |
+| `CONFIG_VARIANT` | `baseline` | `next.config.ts` の `experimental` をパターン切り替えする。`baseline`/`cpus1`/`maxConc1`/`minPages999`/`combo` のいずれか。「各設定の効き方の再実験」で使用 |
 
 ## 実行手順
 
@@ -100,6 +101,21 @@ COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
 
 `connections × ワーカー数 = 1 × 5 = 5` で API 側 peak が頭打ちになり、`MAX_INFLIGHT=30` に届かないためビルドは成功する。これは自前セマフォと同じ範囲を抑える効果が出ていることの実測。
 
+### 各設定の効き方の再実験
+
+Next.js の設定層が1段階目（`generateStaticParams` の `Promise.all`）と2段階目（ページ生成）のどちらに効くかを直接観察する実験。`run-experiments.sh` で5パターン（`baseline` / `cpus1` / `maxConc1` / `minPages999` / `combo`）を順に流し、`peakList` と `peakDetail` を分けて記録する。
+
+```sh
+bash run-experiments.sh
+```
+
+各回ごとに API サーバーを起動・停止し、結果を `experiment-logs/result-<variant>.json` と TSV (`experiment-logs/results.tsv`) に書き出す。ビルド時間は Next.js の `Generating static pages ... in XXXms` ログから別途参照する。
+
+期待される観察:
+
+- `peakList` は全 variant で12（`COMPANIES=12` 由来）に張り付く。Next.js の設定層は1段階目に効かない
+- `peakDetail` は variant に応じて変わる。例: `maxConc1` で5（5ワーカー × 1）、`combo` で1（1ワーカー × 1）
+
 ## 検証結果の見方
 
 ビルド中・ビルド後に2種類のログが出る。両者は別の場所で別のものを数えている点に注意。
@@ -111,14 +127,20 @@ COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
 ```
 [FINAL] {
   "peak": 30,
+  "peakList": 12,
+  "peakDetail": 30,
   "totalRequests": 45,
   "rejected503": 2
 }
 ```
 
-- `peak` … API サーバーが受けた同時処理中リクエストの最大値。受け付けて処理開始で `+1`、応答送信で `-1` する素朴なカウンタ
+- `peak` … API サーバーが受けた同時処理中リクエストの最大値（全エンドポイント合算）。受け付けて処理開始で `+1`、応答送信で `-1` する素朴なカウンタ
+- `peakList` … `/api/companies/{id}/products`（1段階目の `Promise.all` で叩く商品リスト）に絞った同時処理中リクエストの最大値
+- `peakDetail` … `/api/products/{id}`（2段階目の各ページから叩く商品詳細）に絞った同時処理中リクエストの最大値
 - `totalRequests` … ビルド全体で受けた総リクエスト数（503 で即返したぶんも含む）
 - `rejected503` … `MAX_INFLIGHT` 超過で 503 を返した件数。`>0` ならパンクが起きた証拠
+
+`peakList` と `peakDetail` を分けているのは、Next.js の設定層が1段階目と2段階目のどちらを絞るかを直接観察するため。`peak` だけ見ると両者のうち大きい方がそのまま出るので、設定で2段階目を絞ったときに残る1段階目由来のピークが識別できない。
 
 ここで見る数字は「全ワーカー合計」のサーバー視点。複数のワーカーが同時に叩いていれば、その総和としてピークが立つ。
 
