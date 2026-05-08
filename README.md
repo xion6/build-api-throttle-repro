@@ -1,69 +1,94 @@
 # build-api-throttle-repro
 
-Next.js のビルド時に API 同時接続数が爆発する現象を再現し、セマフォによる制限の効果を計測する最小実験。
+Next.js のビルド時に API 同時接続数が急増する現象を再現し、セマフォや undici の接続数制限がどこまで効くかを観測する最小実験です。
 
-## 構成
+## 先に結論
 
-- `api/server.js` — 依存ゼロの Node.js HTTP サーバー（人為遅延、接続数カウンタ、ピーク値ログ）
-- `app/` — Next.js 16 App Router プロジェクト（SSG、`output: 'export'`）
-  - `app/products/[id]/page.tsx` — 動的セグメントを持つ商品詳細ページ
-  - `lib/api-client.ts` — fetch ラッパー（セマフォ ON/OFF、demand 計測）
-  - `lib/semaphore.ts` — FIFO セマフォ実装
+- セマフォ OFF だと、ビルド中に API への同時接続が膨らみ、`MAX_INFLIGHT` を超えると 503 で落ちます。
+- セマフォ ON だと、各ワーカー内の実接続数だけを抑えられます。ワーカー間では共有されません。
+- `undici.setGlobalDispatcher(new Agent({ connections: N }))` でも、実効としては `connections × ワーカー数` で API 側のピークを抑えられます。
+- Next.js の設定層は、1段階目の一覧取得よりも2段階目のページ生成側に効く、という挙動を切り分けて観測できます。
 
-## 環境変数
+## 最短で再現する
 
-### API 側（`api/server.js`）
-| 変数 | 既定値 | 意味 |
-|---|---|---|
-| `PORT` | 3001 | ポート |
-| `RESPONSE_DELAY_MS` | 100 | 応答遅延（ms） |
-| `COMPANIES` | 5 | `/api/companies` が返す件数 |
-| `PRODUCTS_PER_COMPANY` | 5 | 1社あたりの商品件数 |
-| `MAX_INFLIGHT` | `0` | 同時処理中リクエストの上限。`0` で無制限。`>0` で超過分は `503` を即返す（パンク模擬） |
+### 1. API サーバーを起動する
 
-### App 側（ビルド時に参照）
-| 変数 | 既定値 | 意味 |
-|---|---|---|
-| `API_URL` | `http://localhost:3001` | API ベース URL |
-| `SEMAPHORE_LIMIT` | `0` | `0` でセマフォ OFF。`>0` で同時実行を制限 |
-| `UNDICI_LIMIT_PER_WORKER` | `0` | `>0` で `api-client.ts` 初期化時に `setGlobalDispatcher(new Agent({ connections: N }))` を呼ぶ（ワーカー側設定の検証用） |
-| `UNDICI_LIMIT` | `1` | `--require ./preload-dispatcher.js` で起動したときに使う `connections` 値（親→ワーカーへの伝搬検証用） |
-| `CONFIG_VARIANT` | `baseline` | `next.config.ts` の `experimental` をパターン切り替えする。`baseline`/`cpus1`/`maxConc1`/`minPages999`/`combo` のいずれか。「各設定の効き方の再実験」で使用 |
+API 側で同時30件を超えたら 503 を返す設定です。
 
-## 実行手順
-
-ターミナル1 — API サーバー起動（`MAX_INFLIGHT=30` で同時30件超過は503を返す）:
 ```sh
 cd api
 COMPANIES=12 PRODUCTS_PER_COMPANY=10 MAX_INFLIGHT=30 node server.js
 ```
 
-ターミナル2 — App ビルド（セマフォ OFF → 503 でビルド失敗が再現）:
+### 2. セマフォ OFF でビルドする
+
+503 によるビルド失敗を再現します。
+
 ```sh
 cd app
 npm install
 rm -rf .next out
 COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
-SEMAPHORE_LIMIT=0 \
 API_URL=http://localhost:3001 \
+SEMAPHORE_LIMIT=0 \
 npm run build
 ```
 
-ターミナル2 — App ビルド（セマフォ ON、上限5 → 503 が出ずビルド成功）:
+### 3. セマフォ ON でビルドする
+
+同時接続を抑えてビルド成功を確認します。
+
 ```sh
 rm -rf .next out
 SEMAPHORE_LIMIT=5 npm run build
 ```
 
-> 同時接続だけ観察したい（パンクさせない）ときは API 側で `MAX_INFLIGHT` を外す（既定の `0`）。
+補足:
 
-> **重要**: 各ビルド前に rm -rf .next out を実行する。Next.js 16のfetch既定はauto no cacheだが、静的プリレンダー時はビルドキャッシュ（.next/cache/fetch-cache）が再利用され、同一URLの再取得がAPIに届かない場合がある。
+- 同時接続だけ観察したいなら、API 側で `MAX_INFLIGHT` を外します。既定値は `0` です。
+- 各ビルド前に `rm -rf .next out` を実行してください。Next.js 16 では静的プリレンダー時のビルドキャッシュが再利用され、同一 URL の再取得が API に届かないことがあります。
 
-### `undici.setGlobalDispatcher` 検証
+## このリポジトリの構成
 
-`fetch` が内部で使う undici のグローバルディスパッチャを設定するパターンを2通り検証する。
+- `api/server.js`: 依存ゼロの Node.js HTTP サーバー。人為遅延、接続数カウンタ、ピーク値ログを持ちます。
+- `app/`: Next.js 16 App Router プロジェクト。SSG と `output: 'export'` を使います。
+- `app/app/products/[id]/page.tsx`: 動的セグメントを持つ商品詳細ページです。
+- `app/lib/api-client.ts`: fetch ラッパーです。セマフォ ON/OFF と demand を計測します。
+- `app/lib/semaphore.ts`: FIFO セマフォ実装です。
+- `run-experiments.sh`: 設定違いの実験を連続実行します。
+- `experiment-logs/`: 実験結果の JSON と TSV を保存します。
 
-**Setup A: 親プロセスの `--require` 経由**
+## 環境変数
+
+### API 側
+
+対象は `api/server.js` です。
+
+| 変数 | 既定値 | 意味 |
+|---|---|---|
+| `PORT` | 3001 | ポート |
+| `RESPONSE_DELAY_MS` | 100 | 応答遅延(ms) |
+| `COMPANIES` | 5 | `/api/companies` が返す件数 |
+| `PRODUCTS_PER_COMPANY` | 5 | 1社あたりの商品件数 |
+| `MAX_INFLIGHT` | `0` | 同時処理中リクエストの上限。`0` は無制限、`>0` は超過分を即 503 で返します |
+
+### App 側
+
+ビルド時に参照します。
+
+| 変数 | 既定値 | 意味 |
+|---|---|---|
+| `API_URL` | `http://localhost:3001` | API ベース URL |
+| `SEMAPHORE_LIMIT` | `0` | `0` でセマフォ OFF、`>0` で同時実行数を制限 |
+| `UNDICI_LIMIT_PER_WORKER` | `0` | `>0` で `api-client.ts` 初期化時に `setGlobalDispatcher(new Agent({ connections: N }))` を実行 |
+| `UNDICI_LIMIT` | `1` | `--require ./preload-dispatcher.js` で起動したときの `connections` 値 |
+| `CONFIG_VARIANT` | `baseline` | `next.config.ts` の `experimental` 切り替え。`baseline`、`cpus1`、`maxConc1`、`minPages999`、`combo` を使用 |
+
+## undici の接続数制限を検証する
+
+`fetch` の内部で使われる undici のグローバルディスパッチャを、2つの経路で設定して挙動を比べます。
+
+### Setup A: 親プロセスの `--require` で preload する
 
 ```sh
 rm -rf .next out
@@ -74,9 +99,9 @@ COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
   node --require ./preload-dispatcher.js ./node_modules/.bin/next build
 ```
 
-ビルドログに `[PRELOAD pid=...]` が親プロセス + 各ワーカーで出力される。Next.js が親の `process.execArgv` を解析してワーカー起動時の `execArgv` / `NODE_OPTIONS` に転送するため、preload はワーカーでも再実行される。
+ビルドログに `[PRELOAD pid=...]` が親プロセスと各ワーカーで出ます。Next.js が親の `process.execArgv` を解析し、ワーカー起動時の `execArgv` や `NODE_OPTIONS` に転送するためです。
 
-**Setup B: `api-client.ts` モジュールトップレベル**
+### Setup B: `api-client.ts` のモジュール初期化で設定する
 
 ```sh
 rm -rf .next out
@@ -87,11 +112,13 @@ COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
   npm run build
 ```
 
-ビルドログに `[API-CLIENT pid=...]` が各ワーカーで出力される。各ワーカーが `api-client` を import するときにモジュール初期化コードが走るため、setGlobalDispatcher が各ワーカーで実行される。
+ビルドログに `[API-CLIENT pid=...]` が各ワーカーで出ます。各ワーカーが `api-client` を import するときに、モジュール初期化コードが走るためです。
 
-**観測結果（Setup A・B 共通、ワーカー数5・connections=1）**
+### 共通の観測結果
 
-```
+ワーカー数5、`connections=1` のときは、Setup A と B のどちらでも次の結果になりました。
+
+```text
 [FINAL] {
   "peak": 5,
   "totalRequests": 133,
@@ -99,32 +126,45 @@ COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
 }
 ```
 
-`connections × ワーカー数 = 1 × 5 = 5` で API 側 peak が頭打ちになり、`MAX_INFLIGHT=30` に届かないためビルドは成功する。これは自前セマフォと同じ範囲を抑える効果が出ていることの実測。
+`connections × ワーカー数 = 1 × 5 = 5` で API 側の peak が頭打ちになります。`MAX_INFLIGHT=30` に届かないため、ビルドは成功します。自前セマフォと同じ範囲を抑える効果が出ている、という実測です。
 
-### 各設定の効き方の再実験
+## Next.js 設定がどこに効くかを再実験する
 
-Next.js の設定層が1段階目（`generateStaticParams` の `Promise.all`）と2段階目（ページ生成）のどちらに効くかを直接観察する実験。`run-experiments.sh` で5パターン（`baseline` / `cpus1` / `maxConc1` / `minPages999` / `combo`）を順に流し、`peakList` と `peakDetail` を分けて記録する。
+目的は、Next.js の設定層が次のどちらに効くかを切り分けることです。
+
+- 1段階目: `generateStaticParams` 内の `Promise.all` による一覧取得
+- 2段階目: 各ページ生成時の商品詳細取得
+
+`run-experiments.sh` は、`baseline`、`cpus1`、`maxConc1`、`minPages999`、`combo` の5パターンを順に流し、`peakList` と `peakDetail` を分けて記録します。
 
 ```sh
 bash run-experiments.sh
 ```
 
-各回ごとに API サーバーを起動・停止し、結果を `experiment-logs/result-<variant>.json` と TSV (`experiment-logs/results.tsv`) に書き出す。ビルド時間は Next.js の `Generating static pages ... in XXXms` ログから別途参照する。
+出力先:
+
+- `experiment-logs/result-<variant>.json`
+- `experiment-logs/results.tsv`
+
+ビルド時間は、Next.js の `Generating static pages ... in XXXms` ログを別途見ます。
 
 期待される観察:
 
-- `peakList` は全 variant で12（`COMPANIES=12` 由来）に張り付く。Next.js の設定層は1段階目に効かない
-- `peakDetail` は variant に応じて変わる。例: `maxConc1` で5（5ワーカー × 1）、`combo` で1（1ワーカー × 1）
+- `peakList` は全 variant で12に張り付きます。これは `COMPANIES=12` 由来で、設定層が1段階目には効いていないことを示します。
+- `peakDetail` は variant に応じて変わります。たとえば `maxConc1` なら5、`combo` なら1です。
 
-## 検証結果の見方
+## ログの見方
 
-ビルド中・ビルド後に2種類のログが出る。両者は別の場所で別のものを数えている点に注意。
+ビルド中とビルド後に、2種類のログを見ます。両者は数えている対象が違います。
 
-### ログ1: API 側ターミナル
+- API 側ログ: 全ワーカー合算の、実際に受けた同時リクエスト数
+- App 側ログ: 各ワーカー内で、fetch 呼び出しがどれだけ積み上がったか
 
-ビルド完了後に API サーバーを `Ctrl+C` で止めると、最後にこの行が出る:
+### API 側ログ
 
-```
+ビルド完了後に API サーバーを停止すると、最後に次のような行が出ます。
+
+```text
 [FINAL] {
   "peak": 30,
   "peakList": 12,
@@ -134,53 +174,49 @@ bash run-experiments.sh
 }
 ```
 
-- `peak` … API サーバーが受けた同時処理中リクエストの最大値（全エンドポイント合算）。受け付けて処理開始で `+1`、応答送信で `-1` する素朴なカウンタ
-- `peakList` … `/api/companies/{id}/products`（1段階目の `Promise.all` で叩く商品リスト）に絞った同時処理中リクエストの最大値
-- `peakDetail` … `/api/products/{id}`（2段階目の各ページから叩く商品詳細）に絞った同時処理中リクエストの最大値
-- `totalRequests` … ビルド全体で受けた総リクエスト数（503 で即返したぶんも含む）
-- `rejected503` … `MAX_INFLIGHT` 超過で 503 を返した件数。`>0` ならパンクが起きた証拠
+各フィールドの意味:
 
-`peakList` と `peakDetail` を分けているのは、Next.js の設定層が1段階目と2段階目のどちらを絞るかを直接観察するため。`peak` だけ見ると両者のうち大きい方がそのまま出るので、設定で2段階目を絞ったときに残る1段階目由来のピークが識別できない。
+- `peak`: 全エンドポイント合算の同時処理中リクエスト最大値です。受け付け時に `+1`、応答送信で `-1` する単純なカウンタです。
+- `peakList`: `/api/companies/{id}/products` に絞った同時処理中リクエスト最大値です。1段階目の一覧取得を見ます。
+- `peakDetail`: `/api/products/{id}` に絞った同時処理中リクエスト最大値です。2段階目の詳細取得を見ます。
+- `totalRequests`: ビルド全体で受けた総リクエスト数です。503 で即返した分も含みます。
+- `rejected503`: `MAX_INFLIGHT` 超過で 503 を返した件数です。`>0` ならパンクしています。
 
-ここで見る数字は「全ワーカー合計」のサーバー視点。複数のワーカーが同時に叩いていれば、その総和としてピークが立つ。
+`peakList` と `peakDetail` を分けている理由は、設定が1段階目と2段階目のどちらを絞ったかを直接見分けるためです。`peak` だけでは、大きい方に引っ張られて区別できません。
 
-### ログ2: App 側 stdout（ビルドログ）
+### App 側ログ
 
-`npm run build` の出力中に、ワーカーごとに demand peak が更新されたタイミングで出る:
+`npm run build` の出力中には、ワーカーごとに demand peak の更新が出ます。
 
-```
+```text
 [CLIENT pid=12345] demand peak=42 sem=OFF path=/api/products/company-3-product-7
 [CLIENT pid=12345] demand peak=43 sem=OFF path=/api/products/company-3-product-8
 [CLIENT pid=12678] demand peak=39 sem=OFF path=/api/products/company-5-product-2
 ```
 
-セマフォ ON のときは `sem` の中身が `{"active":N,"peak":M,"waiting":W}` になる:
+セマフォ ON だと、`sem` は次のような JSON になります。
 
-```
+```text
 [CLIENT pid=12345] demand peak=42 sem={"active":20,"peak":20,"waiting":22} path=...
 ```
 
-各フィールドの意味（[app/lib/api-client.ts:11-19](app/lib/api-client.ts#L11-L19), [app/lib/semaphore.ts:29-31](app/lib/semaphore.ts#L29-L31)）:
+各フィールドの意味は、[app/lib/api-client.ts](app/lib/api-client.ts#L11-L19) と [app/lib/semaphore.ts](app/lib/semaphore.ts#L29-L31) に対応しています。
 
-- `pid` … ビルドワーカーのプロセス ID。ワーカーごとに別行が出るので、`pid` が複数見えれば複数ワーカーが走っている
-- `demand` … その瞬間に「fetch を呼び出している最中」の数。セマフォ ON でも、acquire 待ちの fetch まで含めて demand に乗る点が肝。`rawFetch` 入口で `+1`、`finally` で `-1`
-- `demand peak` … そのワーカーで観測した demand の最大値。更新時のみ出力されるので、各 `pid` の最後の行がそのワーカーの最終ピーク
-- `sem.active` … セマフォを取得して実際に fetch を流している数。`limit` を超えない
-- `sem.peak` … `active` の最大値（≤ `limit`）
-- `sem.waiting` … acquire を待っている数。これが大きいほど、fetch を呼んだ後に待たされた呼び出しが多い
+- `pid`: ビルドワーカーのプロセス ID です。複数見えれば、複数ワーカーが動いています。
+- `demand`: その瞬間に fetch を呼び出している最中の数です。セマフォ待ちの呼び出しも含みます。
+- `demand peak`: そのワーカーで観測した demand の最大値です。更新時だけ出るので、各 `pid` の最後の行が最終ピークです。
+- `sem.active`: セマフォを取得して、実際に fetch を流している数です。`limit` を超えません。
+- `sem.peak`: `active` の最大値です。常に `limit` 以下です。
+- `sem.waiting`: acquire 待ちの数です。大きいほど、呼び出し後に待たされた fetch が多い状態です。
 
-### 解釈の指針
+## 解釈の指針
 
-1. セマフォ OFF + `MAX_INFLIGHT=30`: 同時接続が 30 で頭打ちになり、超えたぶんは 503。`api-client.ts` が非 2xx で `throw` するためビルドが `Error: fetch ... failed: 503` で落ちる。`rejected503 > 0` で観測できる
-2. セマフォ ON（`SEMAPHORE_LIMIT=5`）+ `MAX_INFLIGHT=30`: API 側 `peak` が `ワーカー数 × 5 = 25` 前後で頭打ち、`MAX_INFLIGHT` を踏まないので 503 が出ずビルド成功
-3. ワーカー単位の `demand peak` が `sem.peak`（=`limit`）を超える現象: セマフォ ON でも `demand peak` は `limit` より大きい値が出る。これは「fetch を呼んだが acquire 待ちで止まっている」呼び出しが demand に乗っているため。**接続数（API 側 peak）と関数呼び出しの concurrency（demand）は別物**で、セマフォは前者だけを抑える、というのが記事の主張に対応する観察
+1. セマフォ OFF かつ `MAX_INFLIGHT=30` では、同時接続が30で頭打ちになり、超えた分は 503 になります。`api-client.ts` は非2xxで throw するため、ビルドは `Error: fetch ... failed: 503` で落ちます。
+2. セマフォ ON かつ `SEMAPHORE_LIMIT=5` では、API 側 `peak` はおおむね `ワーカー数 × 5` で頭打ちになります。`MAX_INFLIGHT` を踏まないので、503 が出ずビルド成功になります。
+3. セマフォ ON でも、ワーカー単位の `demand peak` は `sem.peak` より大きくなり得ます。理由は、fetch を呼んだあと acquire 待ちで止まっている呼び出しも demand に含まれるからです。つまり、接続数と関数呼び出しの concurrency は別物で、セマフォは前者だけを抑えます。
 
-## 既知の前提・限界
+## 既知の前提と限界
 
-- ビルドワーカー数は Next.js の `experimental.cpus`（既定 `os.cpus().length - 1`）と `staticGenerationMinPagesPerWorker`（既定25）の両方で決まる。商品数が25未満では1ワーカーしか立たない可能性
-- セマフォはモジュールスコープなのでワーカープロセスごとに独立。ワーカー間で共有されない（記事の主張のとおり）
-- `output: 'export'` で全静的化。`'use cache'` は使用していない（キャッシュの影響を切り離して同時接続だけを観察する目的）
-
-## ライセンス
-
-MIT
+- ビルドワーカー数は Next.js の `experimental.cpus` と `staticGenerationMinPagesPerWorker` の両方で決まります。商品数が25未満だと、1ワーカーしか立たない可能性があります。
+- セマフォはモジュールスコープなので、ワーカープロセスごとに独立です。ワーカー間では共有されません。
+- `output: 'export'` で全静的化しています。`'use cache'` は使っていません。キャッシュの影響を切り離して同時接続だけを観察するためです。
