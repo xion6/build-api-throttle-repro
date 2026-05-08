@@ -57,6 +57,7 @@ SEMAPHORE_LIMIT=5 npm run build
 - `app/lib/semaphore.ts`: FIFO セマフォ実装です。
 - `run-experiments.sh`: 設定違いの実験を連続実行します。
 - `experiment-logs/`: 実験結果の JSON と TSV を保存します。
+- `api/server-db.js`、`api/init.sql`、`api/package.json`、`docker-compose.yml`、`run-experiments-db.sh`: 裏側に PostgreSQL を置いた版の実験用です。
 
 ## 環境変数
 
@@ -214,6 +215,174 @@ bash run-experiments.sh
 1. セマフォ OFF かつ `MAX_INFLIGHT=30` では、同時接続が30で頭打ちになり、超えた分は 503 になります。`api-client.ts` は非2xxで throw するため、ビルドは `Error: fetch ... failed: 503` で落ちます。
 2. セマフォ ON かつ `SEMAPHORE_LIMIT=5` では、API 側 `peak` はおおむね `ワーカー数 × 5` で頭打ちになります。`MAX_INFLIGHT` を踏まないので、503 が出ずビルド成功になります。
 3. セマフォ ON でも、ワーカー単位の `demand peak` は `sem.peak` より大きくなり得ます。理由は、fetch を呼んだあと acquire 待ちで止まっている呼び出しも demand に含まれるからです。つまり、接続数と関数呼び出しの concurrency は別物で、セマフォは前者だけを抑えます。
+
+## 裏側に DB を置いて検証する
+
+### なぜ DB を置くのか
+
+ここまでの `api/server.js` は、`setTimeout` で遅延を作って、`MAX_INFLIGHT` を超えたら自分で 503 を返していました。これは「API がどこかに上限を持っている」という状態の合成です。
+
+実際のシステムでは、API の裏側に DB があり、その間に **プール** (接続を使い回す貯金箱) が居ます。同時アクセスが増えたとき、最初に詰まるのは API そのものではなく、たいていこのプールか、その先の DB です。
+
+この節では、API と DB の間に PostgreSQL を実際に置いて、次の2種類の詰まりを別々に観測します。
+
+1. プールの**枯渇**: pg の `Pool` が貸せる接続を全部使い切り、次の `connect()` が待ち行列に並ばされる状態
+2. DB 側の**同時接続上限超過**: Postgres の `max_connections` を超えた接続要求が、DB 自体に拒否される状態
+
+### 全体像
+
+リクエストが流れる経路と、各層の上限を並べると次のようになります。
+
+```
+[Next.js ワーカー] -- HTTP --> [API: server-db.js] -- pg.Pool --> [Postgres]
+       ↑                              ↑                  ↑              ↑
+ SEMAPHORE_LIMIT             (常に1接続を借りる)     DB_POOL_MAX   max_connections
+  UNDICI_LIMIT
+```
+
+各層に「同時に通れる本数の上限」があり、**一番狭いところ**で詰まります。アプリ側のセマフォはここでの一番上の層で、DB 側の `max_connections` は一番下の層です。アプリ側で抑えても下流で詰まりうる、逆に下流が広くてもアプリ側で詰まる、というのがこの実験で見えるはずです。
+
+### 用語
+
+#### 接続 (connection)
+
+アプリと DB の間に張る専用の通信路です。1つのリクエストを処理している間、API はこれを1本握り続けます (`server-db.js` がそうなっています)。
+
+#### プール (pg.Pool)
+
+接続を使い回すための、**API 側の貯金箱**です。リクエストが来るたびに新規接続を作ると遅いので、貸し出し→返却→再利用できる仕組みです。
+
+#### `DB_POOL_MAX` と `max_connections` の違い
+
+接続数の上限は **2か所** に存在します。名前が似ていて紛らわしいので、ここで並べて整理します。
+
+| 名前 | 場所 | 意味 | 超えるとどうなるか |
+|---|---|---|---|
+| `DB_POOL_MAX` | **API 側** (アプリ側) | プールが**同時に貸せる接続の最大数**。アプリ側が決める | 新しいリクエストは「誰かが接続を返すまで」プール内で待たされる |
+| `max_connections` | **DB 側** (Postgres 側) | DB が**同時に受け付けられる接続の総数**。DB 側が決める | DB に接続要求が届いた時点で拒否される (`FATAL: sorry, too many clients already`) |
+
+実効上限は**両者の小さい方**で決まります。
+
+- 例 1: `DB_POOL_MAX=5`, `max_connections=100` → 実効5。プールが先に詰まる (= プール枯渇)
+- 例 2: `DB_POOL_MAX=30`, `max_connections=15` → 実効15。プールはまだ余裕があるのに、DB 側で蹴られる
+
+シナリオ `db-noLimit` / `db-sem2` は前者、`db-pgMax15` は後者です。
+
+#### プール枯渇
+
+プールから接続を借りようとしたら、貸せる接続が0で、誰かが返すまで待たされる状態のことです。`DB_POOL_MAX` を小さくすると起きやすくなります。
+
+#### acquire-time (取得待ち時間)
+
+`pool.connect()` を呼んでから、実際に接続が手に入るまでの時間です。プールに余裕があればほぼ0ms、枯渇していれば数百msから秒単位まで伸びます。
+
+#### `pg_sleep`
+
+Postgres にその秒数だけ「何もせず接続を握り続ける」ように頼む関数です。`server-db.js` は応答遅延の代わりにこれを呼ぶので、接続も握り続けます。これで「リクエスト処理中ずっと接続が占有される」現実的な状況を再現しています。
+
+### 構成ファイル
+
+- [docker-compose.yml](docker-compose.yml): Postgres 16を5432で起動。`PG_MAX_CONNECTIONS` で `max_connections` を切り替えられます
+- [api/init.sql](api/init.sql): `companies` と `products` のテーブル定義
+- [api/server-db.js](api/server-db.js): `pg.Pool` 経由で問い合わせる API
+- [api/package.json](api/package.json): `pg` 依存
+- [run-experiments-db.sh](run-experiments-db.sh): 3シナリオを連続実行
+
+### 起動
+
+初回だけ依存をインストールします。
+
+```sh
+docker compose up -d
+cd api && npm install
+```
+
+### 環境変数 (DB 版)
+
+`api/server-db.js` は次の変数を見ます。
+
+| 変数 | 既定値 | 意味 |
+|---|---|---|
+| `PG_HOST` `PG_PORT` `PG_USER` `PG_PASSWORD` `PG_DATABASE` | localhost / 5432 / postgres / postgres / throttle | 接続先 |
+| `DB_POOL_MAX` | 10 | pg の `Pool` が同時に貸せる接続の上限 |
+| `DB_POOL_TIMEOUT_MS` | 5000 | プール待ちでこの時間を超えると `pool.connect()` が reject |
+| `RESPONSE_DELAY_MS` | 100 | `pg_sleep` で接続を握ったまま待つ時間 |
+
+Postgres 側の `max_connections` を変えるときは、`docker-compose.yml` の `PG_MAX_CONNECTIONS` を渡して `docker compose up -d --force-recreate postgres` で再起動します。
+
+### 計測される指標
+
+`server-db.js` の `[FINAL]` ログには次が出ます。シミュレーション版に**プール待ち**と**DB 接続エラー**が増えています。
+
+- `peak`、`peakList`、`peakDetail`、`totalRequests`: シミュレーション版と同じ
+- `rejected503`: プール待ちタイムアウトまたは DB 接続エラーで 503 を返した件数
+- `poolTimeouts`: `DB_POOL_TIMEOUT_MS` 超過の件数
+- `dbConnectErrors`: Postgres から「too many clients」などで接続を拒否された件数
+- `poolWait.{avgMs, p50Ms, p95Ms, p99Ms, maxMs}`: acquire-time の分布
+
+### 実験する
+
+```sh
+bash run-experiments-db.sh
+```
+
+3つのシナリオを順番に走らせ、`experiment-logs/results-db.tsv` に結果を書きます。3つはそれぞれ別の角度から「どこで詰まるか」を見せます。
+
+| scenario | sem | poolMax | pgMax | 何を見るか |
+|---|---|---|---|---|
+| `db-noLimit` | 0 | 5 | 100 | DB は余裕あり、プールだけ狭い → プール待ち時間 |
+| `db-sem2` | 2 | 5 | 100 | アプリ側で抑えるとプール待ちがどれだけ減るか |
+| `db-pgMax15` | 0 | 30 | 15 | プールは広いが DB 自体が狭い → どこでエラーが出るか |
+
+### 実測結果
+
+`COMPANIES=12 PRODUCTS_PER_COMPANY=10 RESPONSE_DELAY_MS=100` での結果です。
+
+| scenario | peakAll | rejected503 | dbConnectErrors | waitAvg | waitP95 | waitMax | buildOk |
+|---|---|---|---|---|---|---|---|
+| `db-noLimit` | 5 | 0 | 0 | 453ms | 715ms | 725ms | yes |
+| `db-sem2` | 5 | 0 | 0 | 68ms | 105ms | 138ms | yes |
+| `db-pgMax15` | 15 | 17 | 17 | 7ms | 21ms | 22ms | no |
+
+#### `db-noLimit`: プールが詰まるとどう見えるか
+
+`peakAll=5` は、API が同時並行で処理できたリクエスト数の最大値です。`DB_POOL_MAX=5` なので、6件目以降は接続を借りるところで待たされます。
+
+`MAX_INFLIGHT` のような即時の拒否はありません。ビルドはちゃんと完走しますが、`waitMax=725ms` のとおり、接続待ちで秒未満のラグが積み上がります。`rejected503=0` でもビルドが遅い、というケースの見え方です。
+
+#### `db-sem2`: アプリ側で抑えると待ちが減る
+
+アプリ側の `SEMAPHORE_LIMIT=2` で、各ワーカーからの fetch 同時実行数を抑えました。
+
+API 側の `peakAll=5` は変わりません (プール幅5のまま)。ただしプールへの殺到が減るので、`waitAvg` が `453ms → 68ms` に下がります。「アプリ側のセマフォは、API のすぐ裏にあるプールの圧力にも効く」という関係を、数字で確認できる場所です。
+
+#### `db-pgMax15`: DB 自体が狭いとどう失敗するか
+
+このシナリオは **Postgres 側の `max_connections=15` のほうが、API 側のプール幅 `DB_POOL_MAX=30` より狭い** という構図です。プールは「30本まで開ける気でいる」のに、DB は「15本までしか受け付けない」という状態を作っています。
+
+ビルドが殺到すると、API は Postgres に16本目以降の接続を開こうとします。Postgres はそれを `FATAL: sorry, too many clients already` で拒否します。`server-db.js` はそのエラーを 503 として返すので、ビルドは `fetch ... failed: 503` で落ちます。
+
+実測値の意味は次のとおりです。
+
+- `peakAll=15`: 同時に成立した接続数が15で頭打ち。`max_connections=15` をそのまま使い切っています
+- `dbConnectErrors=17`: 16本目以降の接続要求が DB に拒否された件数
+- `rejected503=17`: それを 503 として返した件数 (= `dbConnectErrors` と一致)
+
+`docker logs throttle-postgres` を見ると、`FATAL: sorry, too many clients already` が17回ぶん並んでいるのが確認できます。
+
+補足: Postgres には `superuser_reserved_connections` (既定3) という、スーパーユーザー専用に予約される接続枠があります。一般ユーザーで接続する場合の実効上限は `max_connections - superuser_reserved_connections = 12` になります。今回の API は `postgres` ユーザー (スーパーユーザー) でつないでいるので、予約枠3も含めてフルの15本を使えており、`peakAll=15` になっています。
+
+### この実験から読み取れること
+
+- API 側 `peak` は、アプリのセマフォ／undici 上限だけでなく、**裏側で一番狭い層**で頭打ちになります。プール幅で頭打ちなのか DB 上限で頭打ちなのかは、`dbConnectErrors` が出ているかで見分けがつきます
+- `rejected503=0` でも `poolWait` を見る価値があります。落ちないだけで、待ち時間として遅さに転化していることがあります
+- `dbConnectErrors > 0` は、アプリ側のセマフォや undici では救えません。対処は、DB の上限を上げるか、API 側のプールを **DB 上限より狭く** 設定して、自分が先に詰まる側に回って整列させるかです
+
+### 後片付け
+
+```sh
+docker compose down -v
+```
 
 ## 既知の前提と限界
 
