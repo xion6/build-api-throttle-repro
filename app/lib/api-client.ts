@@ -1,7 +1,16 @@
+import { setGlobalDispatcher, Agent } from 'undici';
 import { Semaphore } from './semaphore';
 
 const API_URL = process.env.API_URL || 'http://localhost:3001';
 const LIMIT = parseInt(process.env.SEMAPHORE_LIMIT || '0', 10);
+const UNDICI_PER_WORKER = parseInt(process.env.UNDICI_LIMIT_PER_WORKER || '0', 10);
+
+if (UNDICI_PER_WORKER > 0) {
+  setGlobalDispatcher(new Agent({ connections: UNDICI_PER_WORKER }));
+  console.log(
+    `[API-CLIENT pid=${process.pid}] setGlobalDispatcher connections=${UNDICI_PER_WORKER}`,
+  );
+}
 
 const semaphore = LIMIT > 0 ? new Semaphore(LIMIT) : null;
 

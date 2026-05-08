@@ -26,6 +26,8 @@ Next.js のビルド時に API 同時接続数が爆発する現象を再現し�
 |---|---|---|
 | `API_URL` | `http://localhost:3001` | API ベース URL |
 | `SEMAPHORE_LIMIT` | `0` | `0` でセマフォ OFF。`>0` で同時実行を制限 |
+| `UNDICI_LIMIT_PER_WORKER` | `0` | `>0` で `api-client.ts` 初期化時に `setGlobalDispatcher(new Agent({ connections: N }))` を呼ぶ（ワーカー側設定の検証用） |
+| `UNDICI_LIMIT` | `1` | `--require ./preload-dispatcher.js` で起動したときに使う `connections` 値（親→ワーカーへの伝搬検証用） |
 
 ## 実行手順
 
@@ -55,6 +57,48 @@ SEMAPHORE_LIMIT=5 npm run build
 > 同時接続だけ観察したい（パンクさせない）ときは API 側で `MAX_INFLIGHT` を外す（既定の `0`）。
 
 > **重要**: 各ビルド前に rm -rf .next out を実行する。Next.js 16のfetch既定はauto no cacheだが、静的プリレンダー時はビルドキャッシュ（.next/cache/fetch-cache）が再利用され、同一URLの再取得がAPIに届かない場合がある。
+
+### `undici.setGlobalDispatcher` 検証
+
+`fetch` が内部で使う undici のグローバルディスパッチャを設定するパターンを2通り検証する。
+
+**Setup A: 親プロセスの `--require` 経由**
+
+```sh
+rm -rf .next out
+COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
+  SEMAPHORE_LIMIT=0 \
+  UNDICI_LIMIT=1 \
+  API_URL=http://localhost:3001 \
+  node --require ./preload-dispatcher.js ./node_modules/.bin/next build
+```
+
+ビルドログに `[PRELOAD pid=...]` が親プロセス + 各ワーカーで出力される。Next.js が親の `process.execArgv` を解析してワーカー起動時の `execArgv` / `NODE_OPTIONS` に転送するため、preload はワーカーでも再実行される。
+
+**Setup B: `api-client.ts` モジュールトップレベル**
+
+```sh
+rm -rf .next out
+COMPANIES=12 PRODUCTS_PER_COMPANY=10 \
+  SEMAPHORE_LIMIT=0 \
+  UNDICI_LIMIT_PER_WORKER=1 \
+  API_URL=http://localhost:3001 \
+  npm run build
+```
+
+ビルドログに `[API-CLIENT pid=...]` が各ワーカーで出力される。各ワーカーが `api-client` を import するときにモジュール初期化コードが走るため、setGlobalDispatcher が各ワーカーで実行される。
+
+**観測結果（Setup A・B 共通、ワーカー数5・connections=1）**
+
+```
+[FINAL] {
+  "peak": 5,
+  "totalRequests": 133,
+  "rejected503": 0
+}
+```
+
+`connections × ワーカー数 = 1 × 5 = 5` で API 側 peak が頭打ちになり、`MAX_INFLIGHT=30` に届かないためビルドは成功する。これは自前セマフォと同じ範囲を抑える効果が出ていることの実測。
 
 ## 検証結果の見方
 
