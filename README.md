@@ -55,6 +55,7 @@ SEMAPHORE_LIMIT=5 npm run build
 - `app/app/products/[id]/page.tsx`: 動的セグメントを持つ商品詳細ページです。
 - `app/lib/api-client.ts`: fetch ラッパーです。セマフォ ON/OFF と demand を計測します。
 - `app/lib/semaphore.ts`: FIFO セマフォ実装です。
+- `app/preload-dispatcher.js`: `node --require` で先読みする undici グローバルディスパッチャの初期化スクリプトです。
 - `run-experiments.sh`: 設定違いの実験を連続実行します。
 - `experiment-logs/`: 実験結果の JSON と TSV を保存します。
 - `api/server-db.js`、`api/init.sql`、`api/package.json`、`docker-compose.yml`、`run-experiments-db.sh`: 裏側に PostgreSQL を置いた版の実験用です。
@@ -201,7 +202,7 @@ bash run-experiments.sh
 [CLIENT pid=12345] demand peak=42 sem={"active":20,"peak":20,"waiting":22} path=...
 ```
 
-各フィールドの意味は、[app/lib/api-client.ts](app/lib/api-client.ts#L11-L19) と [app/lib/semaphore.ts](app/lib/semaphore.ts#L29-L31) に対応しています。
+各フィールドの意味は、[app/lib/api-client.ts](app/lib/api-client.ts#L17-L28) と [app/lib/semaphore.ts](app/lib/semaphore.ts#L31-L33) に対応しています。
 
 - `pid`: ビルドワーカーのプロセス ID です。複数見えれば、複数ワーカーが動いています。
 - `demand`: その瞬間に fetch を呼び出している最中の数です。セマフォ待ちの呼び出しも含みます。

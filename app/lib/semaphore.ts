@@ -12,18 +12,20 @@ export class Semaphore {
       return;
     }
     return new Promise((resolve) => {
-      this.waiting.push(() => {
-        this.active++;
-        if (this.active > this.peak) this.peak = this.active;
-        resolve();
-      });
+      this.waiting.push(resolve);
     });
   }
 
   release(): void {
-    this.active--;
+    if (this.active === 0) {
+      throw new Error('Semaphore: release() called without matching acquire()');
+    }
     const next = this.waiting.shift();
-    if (next) next();
+    if (next) {
+      next();
+    } else {
+      this.active--;
+    }
   }
 
   get stats() {
